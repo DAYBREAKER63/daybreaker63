@@ -22,15 +22,40 @@ const LiveMentor: React.FC<LiveMentorProps> = ({ onClose, systemDate, systemTime
   const nextStartTimeRef = useRef<number>(0);
   const sourcesRef = useRef<Set<AudioBufferSourceNode>>(new Set());
   const streamRef = useRef<MediaStream | null>(null);
+  const processorRef = useRef<ScriptProcessorNode | null>(null);
 
   // Auto-start logic
   useEffect(() => {
     if (autoStart) {
       startSession();
     }
+    return () => cleanup();
   }, [autoStart]);
 
-  // Manual Base64 Helpers
+  const cleanup = () => {
+    try {
+      if (sessionRef.current) sessionRef.current.close();
+      if (streamRef.current) streamRef.current.getTracks().forEach(t => t.stop());
+      if (processorRef.current) {
+        processorRef.current.disconnect();
+        processorRef.current.onaudioprocess = null;
+      }
+      if (audioContextRef.current && audioContextRef.current.state !== 'closed') audioContextRef.current.close();
+      if (outputContextRef.current && outputContextRef.current.state !== 'closed') outputContextRef.current.close();
+      
+      sourcesRef.current.forEach(s => { try { s.stop(); } catch(e) {} });
+      sourcesRef.current.clear();
+      
+      sessionRef.current = null;
+      streamRef.current = null;
+      processorRef.current = null;
+      audioContextRef.current = null;
+      outputContextRef.current = null;
+    } catch (e) {
+      console.error("Cleanup Error:", e);
+    }
+  };
+
   const encode = (bytes: Uint8Array) => {
     let binary = '';
     for (let i = 0; i < bytes.byteLength; i++) binary += String.fromCharCode(bytes[i]);
@@ -58,11 +83,16 @@ const LiveMentor: React.FC<LiveMentorProps> = ({ onClose, systemDate, systemTime
   };
 
   const startSession = async () => {
+    // Ensure clean state before starting
+    cleanup();
+    
     setStatus('CONNECTING');
     setErrorMessage(null);
+    nextStartTimeRef.current = 0;
+
     try {
       if (!process.env.API_KEY) {
-        throw new Error("Missing System Key. Check environmental configuration.");
+        throw new Error("Missing System Key. Verification required.");
       }
 
       const ai = new GoogleGenAI({ apiKey: process.env.API_KEY });
@@ -78,6 +108,8 @@ const LiveMentor: React.FC<LiveMentorProps> = ({ onClose, systemDate, systemTime
             setActive(true);
             const source = audioContextRef.current!.createMediaStreamSource(streamRef.current!);
             const processor = audioContextRef.current!.createScriptProcessor(4096, 1, 1);
+            processorRef.current = processor;
+
             processor.onaudioprocess = (e) => {
               const inputData = e.inputBuffer.getChannelData(0);
               const int16 = new Int16Array(inputData.length);
@@ -86,7 +118,7 @@ const LiveMentor: React.FC<LiveMentorProps> = ({ onClose, systemDate, systemTime
               sessionPromise.then(s => s.sendRealtimeInput({
                 media: { data: encode(new Uint8Array(int16.buffer)), mimeType: 'audio/pcm;rate=16000' }
               })).catch(err => {
-                console.error("Audio Processing Socket Error:", err);
+                console.warn("Input Stream Disrupted:", err);
               });
             };
             source.connect(processor);
@@ -121,13 +153,15 @@ const LiveMentor: React.FC<LiveMentorProps> = ({ onClose, systemDate, systemTime
                  setTranscription(prev => [...prev.slice(-4), { role: 'GURU', text: msg.serverContent!.outputTranscription!.text }]);
               }
             } catch (innerError) {
-              console.error("Guru Message Processing Error:", innerError);
+              console.error("Guru Sync Error:", innerError);
             }
           },
-          onerror: (e) => { 
+          onerror: (e: any) => { 
             setStatus('ERROR'); 
-            setErrorMessage("Communication Link Failed: Network Error.");
-            console.error("Guru Socket Error:", e); 
+            const msg = e?.message || "Communication link lost.";
+            setErrorMessage(msg.includes("503") || msg.includes("unavailable") 
+              ? "System Overload. Service temporarily unavailable." 
+              : "Protocol Breach: Network disruption detected.");
           },
           onclose: () => { 
             setStatus('IDLE'); 
@@ -139,49 +173,33 @@ const LiveMentor: React.FC<LiveMentorProps> = ({ onClose, systemDate, systemTime
           speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Fenrir' } } },
           inputAudioTranscription: {},
           outputAudioTranscription: {},
-          systemInstruction: `You are a real, friendly, and motivating Gym Trainer and Performance Mentor named ${aiModelName} (or Guru Ji).
-You talk like a real person—relatable, energetic, and supportive, but still focused on discipline and fitness.
-The current System Date is ${systemDate}. The current System Time is ${systemTime}.
-
-CORE PERSONALITY:
-- Friendly Gym Trainer: Use words like "Brother", "Beta", "Champion", "Buddy".
-- Multilingual: You are fluent in English, Hindi, and Hinglish. 
-- You switch languages naturally based on how the user speaks to you. If they use Hindi/Hinglish, you reply in kind.
-- Conversational: Don't just give orders; have a real conversation about fitness, life, or anything the user wants to discuss.
-- Practical: Give real-world advice on diet, workouts, and mental toughness.
-
-CORE RULES:
-- Identify yourself as ${aiModelName} or Guru Ji.
-- Keep the energy high and the tone encouraging.
-- Be authoritative on fitness but friendly in interaction.
-- If the user is struggling, motivate them like a big brother or a personal trainer would. "Body banani hai na? Toh mehnat karni padegi!"
-- Keep spoken responses punchy and engaging.`
+          systemInstruction: `You are ${aiModelName} (Guru Ji). Friendly, motivating Gym Trainer.
+English/Hindi/Hinglish. High energy. RELATABLE but DISCIPLINED.
+Date: ${systemDate}, Time: ${systemTime}.
+Talk like a real trainer in a gym setting.`
         }
       });
       sessionRef.current = await sessionPromise;
     } catch (e: any) {
       setStatus('ERROR');
-      setErrorMessage(e?.message || "Protocol Failure: Verify Connection.");
-      console.error("Guru Initiation Error:", e);
+      setErrorMessage(e?.message?.includes("503") ? "Service Unavailable. Try again in a moment." : "Initiation Failed: Check environmental stability.");
+      console.error("Guru Connect Error:", e);
     }
   };
 
   const endSession = () => {
-    if (sessionRef.current) sessionRef.current.close();
-    if (streamRef.current) streamRef.current.getTracks().forEach(t => t.stop());
-    if (audioContextRef.current) audioContextRef.current.close();
-    if (outputContextRef.current) outputContextRef.current.close();
+    cleanup();
     setActive(false);
     onClose();
   };
 
   return (
-    <div className="fixed inset-0 z-[100] bg-black flex flex-col items-center justify-center p-8">
-      <div className="w-full max-w-md flex flex-col h-full">
+    <div className="fixed inset-0 z-[100] bg-black flex flex-col items-center justify-center p-8 overflow-hidden">
+      <div className="w-full max-w-md flex flex-col h-full animate-in fade-in duration-700">
         <header className="flex justify-between items-baseline mb-20">
           <div className="flex flex-col gap-1">
             <span className="text-[10px] font-black tracking-[0.6em] text-zinc-800 uppercase">Guru Ji Session</span>
-            <span className="text-[8px] font-mono text-zinc-900 uppercase tracking-widest">NAME: {aiModelName}</span>
+            <span className="text-[8px] font-mono text-zinc-900 uppercase tracking-widest">ID: {aiModelName.replace(/\s+/g, '_').toUpperCase()}</span>
           </div>
           <button onClick={endSession} className="text-[9px] font-black tracking-widest text-zinc-600 hover:text-white transition-colors">
             [ TERMINATE ]
@@ -190,52 +208,72 @@ CORE RULES:
 
         <div className="flex-1 flex flex-col items-center justify-center relative">
           {!active ? (
-            <div className="text-center space-y-12">
-              <p className="text-zinc-600 text-[10px] font-black uppercase tracking-[0.4em] max-w-[200px] mx-auto leading-relaxed">
-                {aiModelName} (Guru Ji) is ready to train.
-              </p>
+            <div className="text-center space-y-12 w-full">
+              <div className="space-y-4">
+                <p className="text-zinc-600 text-[10px] font-black uppercase tracking-[0.4em] max-w-[200px] mx-auto leading-relaxed">
+                  {status === 'ERROR' ? 'LINK DISRUPTED' : `${aiModelName} Standby`}
+                </p>
+                {status === 'CONNECTING' && (
+                  <div className="flex justify-center gap-1">
+                    {[1,2,3].map(i => (
+                      <div key={i} className="w-1 h-1 bg-white animate-bounce" style={{ animationDelay: `${i*0.1}s` }} />
+                    ))}
+                  </div>
+                )}
+              </div>
               
               {errorMessage && (
-                <div className="p-4 border border-red-900/40 bg-red-950/10 mb-6">
-                  <p className="text-[9px] font-black uppercase tracking-widest text-red-700">{errorMessage}</p>
+                <div className="p-6 border border-red-900/30 bg-red-950/5 mb-6 max-w-xs mx-auto">
+                  <p className="text-[9px] font-black uppercase tracking-[0.3em] text-red-800 leading-relaxed mb-4">{errorMessage}</p>
+                  <button 
+                    onClick={startSession}
+                    className="text-[9px] font-black uppercase tracking-widest text-zinc-400 hover:text-white underline decoration-zinc-800 underline-offset-4"
+                  >
+                    [ RE-ESTABLISH LINK ]
+                  </button>
                 </div>
               )}
 
-              <button 
-                onClick={startSession}
-                disabled={status === 'CONNECTING'}
-                className="border border-white px-10 py-5 text-[11px] font-black uppercase tracking-[0.5em] hover:bg-white hover:text-black transition-all disabled:opacity-20"
-              >
-                {status === 'CONNECTING' ? 'CONNECTING...' : 'START CONSULTATION'}
-              </button>
+              {status !== 'ERROR' && (
+                <button 
+                  onClick={startSession}
+                  disabled={status === 'CONNECTING'}
+                  className="border border-zinc-800 px-10 py-5 text-[11px] font-black uppercase tracking-[0.5em] text-zinc-500 hover:text-white hover:border-white transition-all disabled:opacity-20"
+                >
+                  {status === 'CONNECTING' ? 'INITIALIZING...' : 'START CONSULTATION'}
+                </button>
+              )}
             </div>
           ) : (
-            <div className="w-full space-y-24">
+            <div className="w-full space-y-24 animate-in zoom-in-95 duration-1000">
               <div className="flex flex-col items-center gap-4">
                 <div className="w-1 h-1 bg-white animate-ping rounded-full mb-4" />
                 <span className="text-[10px] font-black tracking-[0.8em] text-white uppercase animate-pulse">Session Live</span>
               </div>
 
               <div className="w-full h-[1px] bg-zinc-900 overflow-hidden relative">
-                <div className="absolute inset-0 bg-white/20 animate-[pulse_1s_infinite]" />
+                <div className="absolute inset-0 bg-white/20 animate-[pulse_2s_infinite]" />
               </div>
 
-              <div className="space-y-6 max-h-[300px] overflow-hidden opacity-40">
+              <div className="space-y-8 max-h-[250px] overflow-hidden opacity-40 select-none">
                 {transcription.map((t, i) => (
-                  <div key={i} className="flex flex-col gap-1">
-                    <span className="text-[8px] font-black tracking-widest text-zinc-700">{t.role === 'GURU' ? aiModelName : 'YOU'}</span>
-                    <p className="text-[11px] font-bold uppercase tracking-widest text-zinc-500 leading-tight">
+                  <div key={i} className="flex flex-col gap-1 border-l border-zinc-900 pl-4">
+                    <span className="text-[7px] font-black tracking-widest text-zinc-700">{t.role === 'GURU' ? aiModelName : 'YOU'}</span>
+                    <p className="text-[10px] font-bold uppercase tracking-[0.2em] text-zinc-500 leading-tight">
                       {t.text}
                     </p>
                   </div>
                 ))}
+                {transcription.length === 0 && (
+                  <p className="text-[9px] font-black uppercase tracking-[0.4em] text-zinc-900 text-center italic">Awaiting voice input...</p>
+                )}
               </div>
             </div>
           )}
         </div>
 
-        <footer className="mt-auto py-12 text-center">
-          <span className="text-[8px] font-black uppercase tracking-[1em] text-zinc-900">Training Time: {systemTime}</span>
+        <footer className="mt-auto py-12 text-center border-t border-zinc-950">
+          <span className="text-[8px] font-black uppercase tracking-[1em] text-zinc-900">SYNC_TIME: {systemTime}</span>
         </footer>
       </div>
     </div>
