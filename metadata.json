@@ -1,0 +1,7 @@
+{
+  "name": "FRAME",
+  "description": "A stoic discipline tracker and evaluator for young men focusing on response over reaction. Features a brutal scoring system and a calm, direct AI evaluator.",
+  "requestFramePermissions": [
+    "microphone"
+  ]
+}
